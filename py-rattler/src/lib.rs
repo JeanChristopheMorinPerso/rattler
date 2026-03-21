@@ -23,6 +23,7 @@ mod record;
 mod repo_data;
 mod shell;
 mod solver;
+mod tracing;
 mod utils;
 mod version;
 mod virtual_package;
@@ -187,6 +188,10 @@ fn rattler<'py>(py: Python<'py>, m: Bound<'py, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_install, &m).unwrap())?;
     m.add_function(wrap_pyfunction!(py_index_fs, &m).unwrap())?;
     m.add_function(wrap_pyfunction!(py_index_s3, &m).unwrap())?;
+    m.add_function(wrap_pyfunction!(tracing::setup_tracing, &m).unwrap())?;
+    m.add_function(wrap_pyfunction!(tracing::_emit_test_trace, &m).unwrap())?;
+    m.add_function(wrap_pyfunction!(tracing::_emit_test_trace_with_fields, &m).unwrap())?;
+    m.add_function(wrap_pyfunction!(tracing::_emit_test_trace_fields_only, &m).unwrap())?;
 
     m.add_function(wrap_pyfunction!(package_streaming::extract_tar_bz2, &m).unwrap())?;
     m.add_function(wrap_pyfunction!(package_streaming::extract, &m).unwrap())?;

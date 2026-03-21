@@ -48,6 +48,7 @@ from rattler.lock import (
     PypiLockedPackage,
 )
 from rattler.solver import solve, solve_with_sparse_repodata
+from rattler.tracing import setup_tracing
 
 __version__ = _get_rattler_version()
 del _get_rattler_version
@@ -112,6 +113,7 @@ __all__ = [
     "NoArchLiteral",
     "Link",
     "LinkType",
+    "setup_tracing",
 ]
 
 # PTY support - only available on Unix platforms

@@ -71,6 +71,10 @@ reqwest-retry = { package = "astral-reqwest-retry", version = "0.9.1" }
 async-trait = "0.1"
 http = "1.2"
 
+tracing = "0.1"
+tracing-core = "0.1"
+tracing-subscriber = { version = "0.3.19", default-features = false, features = ["registry", "env-filter"] }
+
 thiserror = "2.0.12"
 url = "2.5.4"
 
