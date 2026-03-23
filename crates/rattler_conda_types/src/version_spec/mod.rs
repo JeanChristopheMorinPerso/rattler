@@ -7,7 +7,6 @@ pub(crate) mod version_tree;
 
 use std::{
     borrow::Cow,
-    convert::TryFrom,
     fmt::{Display, Formatter},
     str::FromStr,
 };
@@ -23,7 +22,7 @@ use version_tree::VersionTree;
 
 use crate::{
     version::StrictVersion, version_spec::version_tree::ParseVersionTreeError, ParseStrictness,
-    ParseStrictness::Lenient, ParseVersionError, Version,
+    ParseStrictness::Lenient, ParseVersionError, Version, VersionBumpError, VersionBumpType,
 };
 
 /// An operator to compare two versions.
@@ -353,14 +352,29 @@ impl VersionSpec {
     }
 }
 
-/// Error returned when a [`VersionSpec`] cannot be converted to
-/// [`Ranges<Version>`] because it contains a [`StrictRange`](VersionSpec::StrictRange) variant.
-#[derive(Debug, Clone, Eq, PartialEq, Error)]
-#[error("cannot convert `StrictRange({0}, ..)` to an interval-based range")]
-pub struct StrictRangeNotRepresentableError(StrictRangeOperator);
+/// Returns the range `[v.with_alpha(), v.bump(Last).with_alpha())` which
+/// corresponds to all versions that start with `v`.
+fn starts_with_range(v: &Version) -> Result<Ranges<Version>, VersionBumpError> {
+    let lower = v.with_alpha().into_owned();
+    let upper = v.bump(VersionBumpType::Last)?.with_alpha().into_owned();
+    Ok(Ranges::between(lower, upper))
+}
+
+/// Returns the range `[v, v.pop_segments(1).bump(Last).with_alpha())`
+/// which corresponds to all versions compatible with `v` (i.e. `~=v`).
+fn compatible_with_range(v: &Version) -> Result<Ranges<Version>, VersionBumpError> {
+    let lower = v.clone();
+    let upper = v
+        .pop_segments(1)
+        .expect("compatible version always has >= 2 segments")
+        .bump(VersionBumpType::Last)?
+        .with_alpha()
+        .into_owned();
+    Ok(Ranges::between(lower, upper))
+}
 
 impl TryFrom<&VersionSpec> for Ranges<Version> {
-    type Error = StrictRangeNotRepresentableError;
+    type Error = VersionBumpError;
 
     fn try_from(spec: &VersionSpec) -> Result<Self, Self::Error> {
         match spec {
@@ -380,7 +394,16 @@ impl TryFrom<&VersionSpec> for Ranges<Version> {
                 Ok(Ranges::strictly_lower_than(v.clone()))
             }
             VersionSpec::Range(RangeOperator::LessEquals, v) => Ok(Ranges::lower_than(v.clone())),
-            VersionSpec::StrictRange(op, _) => Err(StrictRangeNotRepresentableError(*op)),
+            VersionSpec::StrictRange(StrictRangeOperator::StartsWith, v) => starts_with_range(&v.0),
+            VersionSpec::StrictRange(StrictRangeOperator::NotStartsWith, v) => {
+                Ok(starts_with_range(&v.0)?.complement())
+            }
+            VersionSpec::StrictRange(StrictRangeOperator::Compatible, v) => {
+                compatible_with_range(&v.0)
+            }
+            VersionSpec::StrictRange(StrictRangeOperator::NotCompatible, v) => {
+                Ok(compatible_with_range(&v.0)?.complement())
+            }
             VersionSpec::Group(LogicalOperator::And, specs) => {
                 specs.iter().try_fold(Ranges::full(), |acc, s| {
                     let r = Ranges::try_from(s)?;
@@ -409,7 +432,7 @@ mod tests {
     use crate::{
         version_spec::{
             parse::ParseConstraintError, EqualityOperator, LogicalOperator, ParseVersionSpecError,
-            RangeOperator, StrictRangeNotRepresentableError, StrictRangeOperator,
+            RangeOperator, StrictRangeOperator,
         },
         ParseStrictness, StrictVersion, Version, VersionSpec,
     };
@@ -765,45 +788,57 @@ mod tests {
     }
 
     #[test]
-    fn test_try_from_strict_range_errors() {
-        assert_eq!(
-            Ranges::<Version>::try_from(
-                &VersionSpec::from_str("1.2.*", ParseStrictness::Strict).unwrap()
-            )
-            .unwrap_err(),
-            StrictRangeNotRepresentableError(StrictRangeOperator::StartsWith)
-        );
-
-        assert_eq!(
-            Ranges::<Version>::try_from(
-                &VersionSpec::from_str("~=2.4", ParseStrictness::Strict).unwrap()
-            )
-            .unwrap_err(),
-            StrictRangeNotRepresentableError(StrictRangeOperator::Compatible)
-        );
-
-        assert_eq!(
-            Ranges::<Version>::try_from(&VersionSpec::StrictRange(
-                StrictRangeOperator::NotStartsWith,
-                StrictVersion(Version::from_str("1.2").unwrap()),
-            ))
-            .unwrap_err(),
-            StrictRangeNotRepresentableError(StrictRangeOperator::NotStartsWith)
-        );
-
-        assert_eq!(
-            Ranges::<Version>::try_from(&VersionSpec::StrictRange(
-                StrictRangeOperator::NotCompatible,
-                StrictVersion(Version::from_str("2.4").unwrap()),
-            ))
-            .unwrap_err(),
-            StrictRangeNotRepresentableError(StrictRangeOperator::NotCompatible)
-        );
+    fn test_try_from_starts_with() {
+        // 1.2.* => >=1.2.0a0,<1.3.0a0
+        let spec = VersionSpec::from_str("1.2.*", ParseStrictness::Strict).unwrap();
+        let ranges = Ranges::<Version>::try_from(&spec).unwrap();
+        assert!(ranges.contains(&Version::from_str("1.2.0").unwrap()));
+        assert!(ranges.contains(&Version::from_str("1.2.3").unwrap()));
+        assert!(ranges.contains(&Version::from_str("1.2.99").unwrap()));
+        assert!(!ranges.contains(&Version::from_str("1.3.0").unwrap()));
+        assert!(!ranges.contains(&Version::from_str("1.1.0").unwrap()));
     }
 
     #[test]
-    fn test_try_from_group_with_strict_range_propagates_error() {
-        // Build the group manually since `=1.2.*` doesn't parse in Strict mode
+    fn test_try_from_not_starts_with() {
+        let spec = VersionSpec::StrictRange(
+            StrictRangeOperator::NotStartsWith,
+            StrictVersion(Version::from_str("1.2").unwrap()),
+        );
+        let ranges = Ranges::<Version>::try_from(&spec).unwrap();
+        assert!(!ranges.contains(&Version::from_str("1.2.0").unwrap()));
+        assert!(!ranges.contains(&Version::from_str("1.2.3").unwrap()));
+        assert!(ranges.contains(&Version::from_str("1.3.0").unwrap()));
+        assert!(ranges.contains(&Version::from_str("1.1.0").unwrap()));
+    }
+
+    #[test]
+    fn test_try_from_compatible() {
+        // ~=2.4 => >=2.4.0a0,<3.0a0
+        let spec = VersionSpec::from_str("~=2.4", ParseStrictness::Strict).unwrap();
+        let ranges = Ranges::<Version>::try_from(&spec).unwrap();
+        assert!(ranges.contains(&Version::from_str("2.4").unwrap()));
+        assert!(ranges.contains(&Version::from_str("2.5").unwrap()));
+        assert!(ranges.contains(&Version::from_str("2.99").unwrap()));
+        assert!(!ranges.contains(&Version::from_str("3.0").unwrap()));
+        assert!(!ranges.contains(&Version::from_str("2.3").unwrap()));
+    }
+
+    #[test]
+    fn test_try_from_not_compatible() {
+        let spec = VersionSpec::StrictRange(
+            StrictRangeOperator::NotCompatible,
+            StrictVersion(Version::from_str("2.4").unwrap()),
+        );
+        let ranges = Ranges::<Version>::try_from(&spec).unwrap();
+        assert!(!ranges.contains(&Version::from_str("2.4").unwrap()));
+        assert!(!ranges.contains(&Version::from_str("2.5").unwrap()));
+        assert!(ranges.contains(&Version::from_str("3.0").unwrap()));
+        assert!(ranges.contains(&Version::from_str("2.3").unwrap()));
+    }
+
+    #[test]
+    fn test_try_from_group_with_strict_range() {
         let spec = VersionSpec::Group(
             LogicalOperator::And,
             vec![
@@ -811,7 +846,11 @@ mod tests {
                 VersionSpec::from_str("1.2.*", ParseStrictness::Strict).unwrap(),
             ],
         );
-        assert!(Ranges::<Version>::try_from(&spec).is_err());
+        let ranges = Ranges::<Version>::try_from(&spec).unwrap();
+        assert!(ranges.contains(&Version::from_str("1.2.3").unwrap()));
+        assert!(ranges.contains(&Version::from_str("1.2.99").unwrap()));
+        assert!(!ranges.contains(&Version::from_str("1.2.2").unwrap()));
+        assert!(!ranges.contains(&Version::from_str("1.3.0").unwrap()));
     }
 
     #[test]
@@ -976,7 +1015,9 @@ mod tests {
     }
 
     #[test]
-    fn test_try_from_deeply_nested_strict_range_error() {
+    fn test_try_from_deeply_nested_strict_range() {
+        // (>=1.0 | (<2.0 AND 1.2.*)) => full | [1.2.0a0, 1.3.0a0) ∩ (-∞, 2.0) => full
+        // Actually >=1.0 already covers most, so union with anything is >=1.0
         let spec = VersionSpec::Group(
             LogicalOperator::And,
             vec![VersionSpec::Group(
@@ -994,10 +1035,11 @@ mod tests {
             )],
         );
 
-        assert_eq!(
-            Ranges::<Version>::try_from(&spec).unwrap_err(),
-            StrictRangeNotRepresentableError(StrictRangeOperator::StartsWith)
-        );
+        let ranges = Ranges::<Version>::try_from(&spec).unwrap();
+        assert!(ranges.contains(&Version::from_str("1.0").unwrap()));
+        assert!(ranges.contains(&Version::from_str("1.2.5").unwrap()));
+        assert!(ranges.contains(&Version::from_str("2.0").unwrap()));
+        assert!(!ranges.contains(&Version::from_str("0.9").unwrap()));
     }
 
     #[test]
@@ -1027,5 +1069,35 @@ mod tests {
         assert!(!inner.contains(&Version::from_str("1.2").unwrap()));
         assert!(outer.contains(&Version::from_str("1.2").unwrap()));
         assert!(!outer.contains(&Version::from_str("3.0").unwrap()));
+    }
+
+    #[test]
+    fn test_try_from_matches_consistency_starts_with() {
+        let spec = VersionSpec::from_str("1.2.*", ParseStrictness::Strict).unwrap();
+        let ranges = Ranges::<Version>::try_from(&spec).unwrap();
+        for v_str in [
+            "1.1", "1.2", "1.2a0", "1.2.0", "1.2.0a0", "1.2.1", "1.2.99", "1.3", "1.3.0a0",
+        ] {
+            assert_eq!(
+                spec.matches(&Version::from_str(v_str).unwrap()),
+                ranges.contains(&Version::from_str(v_str).unwrap()),
+                "mismatch for version={v_str}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_try_from_matches_consistency_compatible() {
+        let spec = VersionSpec::from_str("~=1.1", ParseStrictness::Strict).unwrap();
+        let ranges = Ranges::<Version>::try_from(&spec).unwrap();
+        for v_str in [
+            "1.0", "1.1a0", "1.1", "1.1.0", "1.1.1", "1.1.2", "1.2", "1.2.0a0", "2.0",
+        ] {
+            assert_eq!(
+                spec.matches(&Version::from_str(v_str).unwrap()),
+                ranges.contains(&Version::from_str(v_str).unwrap()),
+                "mismatch for version={v_str}"
+            );
+        }
     }
 }
