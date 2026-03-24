@@ -76,6 +76,42 @@ impl Version {
         })
     }
 
+    /// Like [`Self::with_alpha`] but appends `a0` to the *last* segment
+    /// instead of adding a new `.0a0` segment.
+    ///
+    /// For example, `1.2` becomes `1.2a0` (segments: `[1], [2, a, 0]`),
+    /// whereas `with_alpha` would produce `1.2.0a0` (`[1], [2], [0, a, 0]`).
+    ///
+    /// If the last segment already contains an iden component the version is
+    /// returned unchanged (same behaviour as `with_alpha`).
+    pub fn with_alpha_on_last_segment(&self) -> Cow<'_, Self> {
+        let last_segment = self.segments().last().expect("at least one segment");
+        let has_iden = last_segment.components().any(|c| c.as_iden().is_some());
+        if has_iden {
+            return Cow::Borrowed(self);
+        }
+        let local_segment_index = self.local_segment_index().unwrap_or(self.segments.len());
+        let mut segments = self.segments[0..local_segment_index].to_vec();
+        let components_offset = segments.iter().map(|s| s.len() as usize).sum::<usize>()
+            + usize::from(self.has_epoch());
+
+        // Extend the last segment by 2 components (iden 'a' + numeral 0)
+        let last = segments.last_mut().expect("at least one segment");
+        *last = last.with_component_count(last.len() + 2).unwrap();
+
+        segments.extend(self.segments[local_segment_index..].iter());
+
+        let mut components = self.components.clone();
+        components.insert(components_offset, Component::Iden("a".into()));
+        components.insert(components_offset + 1, Component::Numeral(0));
+
+        Cow::Owned(Version {
+            components,
+            segments: segments.into(),
+            flags: self.flags,
+        })
+    }
+
     /// Remove the local segment from the version if it exists.
     /// Returns a new version without the local segment.
     ///

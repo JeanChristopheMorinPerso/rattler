@@ -352,10 +352,15 @@ impl VersionSpec {
     }
 }
 
-/// Returns the range `[v.with_alpha(), v.bump(Last).with_alpha())` which
+/// Returns the range `[v_alpha, v.bump(Last).with_alpha())` which
 /// corresponds to all versions that start with `v`.
+///
+/// The lower bound appends `a0` directly to the last segment (e.g. `1.2` →
+/// `1.2a0`) rather than adding a new `.0a0` segment (which would give
+/// `1.2.0a0`).  This is necessary because `1.2a0 < 1.2.0a0` in conda
+/// version ordering, yet `1.2a0.starts_with(1.2)` is true.
 fn starts_with_range(v: &Version) -> Result<Ranges<Version>, VersionBumpError> {
-    let lower = v.with_alpha().into_owned();
+    let lower = v.with_alpha_on_last_segment().into_owned();
     let upper = v.bump(VersionBumpType::Last)?.with_alpha().into_owned();
     Ok(Ranges::between(lower, upper))
 }
