@@ -8,6 +8,7 @@ pub(crate) mod version_tree;
 use std::{
     borrow::Cow,
     fmt::{Display, Formatter},
+    ops::Bound,
     str::FromStr,
 };
 
@@ -425,6 +426,70 @@ impl TryFrom<&VersionSpec> for Ranges<Version> {
     }
 }
 
+/// Converts a set of version ranges back into a [`VersionSpec`].
+///
+/// Note: this conversion is lossy for specs that use strict operators
+/// (e.g. `~=2.4`, `1.2.*`, `!=1.0`). Those are converted to their
+/// equivalent simple range form (e.g. `>=2.4,<3.0a0`), so a round-trip
+/// through [`Ranges`] preserves *semantics* but not the original syntax.
+impl From<Ranges<Version>> for VersionSpec {
+    fn from(ranges: Ranges<Version>) -> Self {
+        fn segment_to_spec(lower: Bound<Version>, upper: Bound<Version>) -> VersionSpec {
+            use std::ops::Bound::{Excluded, Included, Unbounded};
+
+            match (lower, upper) {
+                (Unbounded, Unbounded) => VersionSpec::Any,
+                (Unbounded, Excluded(v)) => VersionSpec::Range(RangeOperator::Less, v),
+                (Unbounded, Included(v)) => VersionSpec::Range(RangeOperator::LessEquals, v),
+                (Included(v), Unbounded) => VersionSpec::Range(RangeOperator::GreaterEquals, v),
+                (Excluded(v), Unbounded) => VersionSpec::Range(RangeOperator::Greater, v),
+                (Included(lo), Included(hi)) if lo == hi => {
+                    VersionSpec::Exact(EqualityOperator::Equals, lo)
+                }
+                (Included(lo), Excluded(hi)) => VersionSpec::Group(
+                    LogicalOperator::And,
+                    vec![
+                        VersionSpec::Range(RangeOperator::GreaterEquals, lo),
+                        VersionSpec::Range(RangeOperator::Less, hi),
+                    ],
+                ),
+                (Included(lo), Included(hi)) => VersionSpec::Group(
+                    LogicalOperator::And,
+                    vec![
+                        VersionSpec::Range(RangeOperator::GreaterEquals, lo),
+                        VersionSpec::Range(RangeOperator::LessEquals, hi),
+                    ],
+                ),
+                (Excluded(lo), Excluded(hi)) => VersionSpec::Group(
+                    LogicalOperator::And,
+                    vec![
+                        VersionSpec::Range(RangeOperator::Greater, lo),
+                        VersionSpec::Range(RangeOperator::Less, hi),
+                    ],
+                ),
+                (Excluded(lo), Included(hi)) => VersionSpec::Group(
+                    LogicalOperator::And,
+                    vec![
+                        VersionSpec::Range(RangeOperator::Greater, lo),
+                        VersionSpec::Range(RangeOperator::LessEquals, hi),
+                    ],
+                ),
+            }
+        }
+
+        let mut specs: Vec<VersionSpec> = ranges
+            .into_iter()
+            .map(|(lower, upper)| segment_to_spec(lower, upper))
+            .collect();
+
+        match specs.len() {
+            0 => VersionSpec::None,
+            1 => specs.pop().expect("a single segment exists"),
+            _ => VersionSpec::Group(LogicalOperator::Or, specs),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
@@ -441,6 +506,17 @@ mod tests {
         },
         ParseStrictness, StrictVersion, Version, VersionSpec,
     };
+
+    fn assert_same_matches(lhs: &VersionSpec, rhs: &VersionSpec, versions: &[&str]) {
+        for version_str in versions {
+            let version = Version::from_str(version_str).unwrap();
+            assert_eq!(
+                lhs.matches(&version),
+                rhs.matches(&version),
+                "mismatch for version={version_str}, lhs={lhs}, rhs={rhs}"
+            );
+        }
+    }
 
     #[test]
     fn test_simple() {
@@ -1104,5 +1180,103 @@ mod tests {
                 "mismatch for version={v_str}"
             );
         }
+    }
+
+    #[test]
+    fn test_from_ranges_round_trip_non_strict_semantics() {
+        let candidate_versions = [
+            "0.9", "1.0", "1.0.0", "1.2.3", "1.5", "1.9.9", "2.0", "2.4", "3.0", "1!1.0",
+        ];
+        let specs = vec![
+            VersionSpec::None,
+            VersionSpec::Any,
+            VersionSpec::from_str("==1.2.3", ParseStrictness::Strict).unwrap(),
+            VersionSpec::from_str("!=1.2.3", ParseStrictness::Strict).unwrap(),
+            VersionSpec::from_str(">1.2.3", ParseStrictness::Strict).unwrap(),
+            VersionSpec::from_str(">=1.2.3", ParseStrictness::Strict).unwrap(),
+            VersionSpec::from_str("<2.0.0", ParseStrictness::Strict).unwrap(),
+            VersionSpec::from_str("<=2.0.0", ParseStrictness::Strict).unwrap(),
+            VersionSpec::from_str(">=1.2.3,<2.0.0", ParseStrictness::Strict).unwrap(),
+            VersionSpec::from_str(">=2.0.0|<1.0.0", ParseStrictness::Strict).unwrap(),
+            VersionSpec::from_str(">=1,<2|>=3,<4", ParseStrictness::Strict).unwrap(),
+        ];
+
+        for spec in specs {
+            let round_trip = VersionSpec::from(Ranges::<Version>::try_from(&spec).unwrap());
+            assert_same_matches(&spec, &round_trip, &candidate_versions);
+        }
+    }
+
+    #[test]
+    fn test_from_ranges_edge_cases() {
+        let singleton = Version::from_str("1.2.3").unwrap();
+
+        assert_eq!(
+            VersionSpec::from(Ranges::<Version>::empty()),
+            VersionSpec::None
+        );
+        assert_eq!(
+            VersionSpec::from(Ranges::<Version>::full()),
+            VersionSpec::Any
+        );
+        assert_eq!(
+            VersionSpec::from(Ranges::<Version>::singleton(singleton.clone())),
+            VersionSpec::Exact(EqualityOperator::Equals, singleton)
+        );
+    }
+
+    #[test]
+    fn test_from_ranges_not_equals_multi_segment() {
+        let value = Version::from_str("1.0").unwrap();
+        let spec = VersionSpec::from_str("!=1.0", ParseStrictness::Strict).unwrap();
+
+        let round_trip = VersionSpec::from(Ranges::<Version>::try_from(&spec).unwrap());
+
+        assert_eq!(
+            round_trip,
+            VersionSpec::Group(
+                LogicalOperator::Or,
+                vec![
+                    VersionSpec::Range(RangeOperator::Less, value.clone()),
+                    VersionSpec::Range(RangeOperator::Greater, value),
+                ],
+            )
+        );
+    }
+
+    #[test]
+    fn test_from_ranges_lossy_round_trip_strict_range_semantics() {
+        let candidate_versions = [
+            "1.1", "1.2", "1.2a0", "1.2.0", "1.2.9", "1.3", "2.3", "2.4", "2.5", "3.0",
+        ];
+
+        for source in ["1.2.*", "~=2.4"] {
+            let strict_spec = VersionSpec::from_str(source, ParseStrictness::Strict).unwrap();
+            let round_trip = VersionSpec::from(Ranges::<Version>::try_from(&strict_spec).unwrap());
+
+            assert_matches!(
+                &round_trip,
+                VersionSpec::Group(LogicalOperator::And, parts)
+                    if matches!(parts.as_slice(), [
+                        VersionSpec::Range(RangeOperator::GreaterEquals, _),
+                        VersionSpec::Range(RangeOperator::Less, _)
+                    ])
+            );
+            assert_same_matches(&strict_spec, &round_trip, &candidate_versions);
+        }
+    }
+
+    #[test]
+    fn test_from_ranges_adjacent_or_simplifies_to_single_range() {
+        let original = VersionSpec::from_str(">=1,<2|>=2", ParseStrictness::Strict).unwrap();
+        let round_trip = VersionSpec::from(Ranges::<Version>::try_from(&original).unwrap());
+        let expected = VersionSpec::from_str(">=1", ParseStrictness::Strict).unwrap();
+
+        assert_eq!(round_trip, expected);
+        assert_same_matches(
+            &original,
+            &round_trip,
+            &["0.9", "1", "1.5", "1.999", "2", "3.0", "1!1"],
+        );
     }
 }
