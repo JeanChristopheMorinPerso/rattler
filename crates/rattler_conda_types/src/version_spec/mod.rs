@@ -366,16 +366,23 @@ fn starts_with_range(v: &Version) -> Result<Ranges<Version>, VersionBumpError> {
     Ok(Ranges::between(lower, upper))
 }
 
-/// Returns the range `[v, v.pop_segments(1).bump(Last).with_alpha())`
-/// which corresponds to all versions compatible with `v` (i.e. `~=v`).
+/// Returns the range for all versions compatible with `v` (i.e. `~=v`).
+///
+/// For multi-segment versions this is `[v, v.pop_segments(1).bump(Last).with_alpha())`.
+/// For single-segment versions we need the next epoch boundary instead, so
+/// `~=1` becomes `>=1,<1!0`.
 fn compatible_with_range(v: &Version) -> Result<Ranges<Version>, VersionBumpError> {
     let lower = v.clone();
-    let upper = v
-        .pop_segments(1)
-        .expect("compatible version always has >= 2 segments")
-        .bump(VersionBumpType::Last)?
-        .with_alpha()
-        .into_owned();
+    let upper = if v.segment_count() == 1 {
+        Version::from_str(&format!("{}!0", v.epoch() + 1))
+            .expect("constructed epoch boundary is always a valid version")
+    } else {
+        v.pop_segments(1)
+            .expect("compatible version always has >= 2 segments")
+            .bump(VersionBumpType::Last)?
+            .with_alpha()
+            .into_owned()
+    };
     Ok(Ranges::between(lower, upper))
 }
 
@@ -903,6 +910,23 @@ mod tests {
         assert!(ranges.contains(&Version::from_str("2.99").unwrap()));
         assert!(!ranges.contains(&Version::from_str("3.0").unwrap()));
         assert!(!ranges.contains(&Version::from_str("2.3").unwrap()));
+    }
+
+    #[test]
+    fn test_try_from_compatible_single_segment() {
+        let spec = VersionSpec::from_str("~=1", ParseStrictness::Strict).unwrap();
+        let ranges = Ranges::<Version>::try_from(&spec).unwrap();
+        let expected = Ranges::<Version>::try_from(
+            &VersionSpec::from_str(">=1,<1!0", ParseStrictness::Strict).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(ranges, expected);
+        assert!(ranges.contains(&Version::from_str("1").unwrap()));
+        assert!(ranges.contains(&Version::from_str("1.2").unwrap()));
+        assert!(ranges.contains(&Version::from_str("100").unwrap()));
+        assert!(!ranges.contains(&Version::from_str("0.9").unwrap()));
+        assert!(!ranges.contains(&Version::from_str("1!0").unwrap()));
     }
 
     #[test]
