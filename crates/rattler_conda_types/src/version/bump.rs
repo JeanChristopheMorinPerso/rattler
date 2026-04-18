@@ -76,81 +76,6 @@ impl Version {
         })
     }
 
-    /// Like [`Self::with_alpha`] but appends `a0` to the *last* segment
-    /// instead of adding a new `.0a0` segment.
-    ///
-    /// For example, `1.2` becomes `1.2a0` (segments: `[1], [2, a, 0]`),
-    /// whereas `with_alpha` would produce `1.2.0a0` (`[1], [2], [0, a, 0]`).
-    ///
-    /// If the last segment already contains an iden component the version is
-    /// returned unchanged (same behaviour as `with_alpha`).
-    pub fn with_alpha_on_last_segment(&self) -> Cow<'_, Self> {
-        let last_segment = self.segments().last().expect("at least one segment");
-        let has_iden = last_segment.components().any(|c| c.as_iden().is_some());
-        if has_iden {
-            return Cow::Borrowed(self);
-        }
-        let local_segment_index = self.local_segment_index().unwrap_or(self.segments.len());
-        let mut segments = self.segments[0..local_segment_index].to_vec();
-        let components_offset = segments.iter().map(|s| s.len() as usize).sum::<usize>()
-            + usize::from(self.has_epoch());
-
-        // Extend the last segment by 2 components (iden 'a' + numeral 0)
-        let last = segments.last_mut().expect("at least one segment");
-        *last = last.with_component_count(last.len() + 2).unwrap();
-
-        segments.extend(self.segments[local_segment_index..].iter());
-
-        let mut components = self.components.clone();
-        components.insert(components_offset, Component::Iden("a".into()));
-        components.insert(components_offset + 1, Component::Numeral(0));
-
-        Cow::Owned(Version {
-            components,
-            segments: segments.into(),
-            flags: self.flags,
-        })
-    }
-
-    /// Appends `dev` to the *last* segment instead of adding a new segment.
-    ///
-    /// For example, `1.2` becomes `1.2dev` (segments: `[1], [2, dev]`).
-    /// This is useful when lowering prefix-style constraints to an interval,
-    /// because `dev` sorts below numerals and identifiers whereas `a0` does
-    /// not.
-    ///
-    /// If the last segment already contains a non-numeric component the version
-    /// is returned unchanged. That keeps this helper focused on numeric-tail
-    /// prefixes such as `1.2` or `1.2.3`, which are the cases where the `dev`
-    /// floor is exact. Prefixes that already end in a non-numeric component can
-    /// still have versions below this returned value while matching the same
-    /// prefix (for example `1.2dev.dev` starts with `1.2dev` but sorts below it).
-    pub fn with_dev_on_last_segment(&self) -> Cow<'_, Self> {
-        let last_segment = self.segments().last().expect("at least one segment");
-        let has_non_numeric = last_segment.components().any(|c| !c.is_numeric());
-        if has_non_numeric {
-            return Cow::Borrowed(self);
-        }
-        let local_segment_index = self.local_segment_index().unwrap_or(self.segments.len());
-        let mut segments = self.segments[0..local_segment_index].to_vec();
-        let components_offset = segments.iter().map(|s| s.len() as usize).sum::<usize>()
-            + usize::from(self.has_epoch());
-
-        let last = segments.last_mut().expect("at least one segment");
-        *last = last.with_component_count(last.len() + 1).unwrap();
-
-        segments.extend(self.segments[local_segment_index..].iter());
-
-        let mut components = self.components.clone();
-        components.insert(components_offset, Component::Dev);
-
-        Cow::Owned(Version {
-            components,
-            segments: segments.into(),
-            flags: self.flags,
-        })
-    }
-
     /// Appends `a` to the final plain identifier component of the last segment.
     ///
     /// For example, `1.2a` becomes `1.2aa` and `1.2rc` becomes `1.2rca`.
@@ -387,6 +312,47 @@ impl Version {
     }
 }
 
+/// Appends `dev` to the *last* segment instead of adding a new segment.
+///
+/// For example, `1.2` becomes `1.2dev` (segments: `[1], [2, dev]`).
+/// This is useful when lowering prefix-style constraints to an interval,
+/// because `dev` sorts below numerals and identifiers whereas `a0` does
+/// not.
+///
+/// If the last segment already contains a non-numeric component the version
+/// is returned unchanged. That keeps this helper focused on numeric-tail
+/// prefixes such as `1.2` or `1.2.3`, which are the cases where the `dev`
+/// floor is exact. Prefixes that already end in a non-numeric component can
+/// still have versions below this returned value while matching the same
+/// prefix (for example `1.2dev.dev` starts with `1.2dev` but sorts below it).
+pub(crate) fn with_dev_on_last_segment(version: &Version) -> Cow<'_, Version> {
+    let last_segment = version.segments().last().expect("at least one segment");
+    let has_non_numeric = last_segment.components().any(|c| !c.is_numeric());
+    if has_non_numeric {
+        return Cow::Borrowed(version);
+    }
+    let local_segment_index = version
+        .local_segment_index()
+        .unwrap_or(version.segments.len());
+    let mut segments = version.segments[0..local_segment_index].to_vec();
+    let components_offset =
+        segments.iter().map(|s| s.len() as usize).sum::<usize>() + usize::from(version.has_epoch());
+
+    let last = segments.last_mut().expect("at least one segment");
+    *last = last.with_component_count(last.len() + 1).unwrap();
+
+    segments.extend(version.segments[local_segment_index..].iter());
+
+    let mut components = version.components.clone();
+    components.insert(components_offset, Component::Dev);
+
+    Cow::Owned(Version {
+        components,
+        segments: segments.into(),
+        flags: version.flags,
+    })
+}
+
 #[cfg(test)]
 mod test {
     use crate::{Version, VersionBumpType};
@@ -508,10 +474,7 @@ mod test {
     #[case("1.2dev", "1.2dev")]
     fn with_dev_on_last_segment(#[case] input: &str, #[case] expected: &str) {
         assert_eq!(
-            Version::from_str(input)
-                .unwrap()
-                .with_dev_on_last_segment()
-                .into_owned(),
+            super::with_dev_on_last_segment(&Version::from_str(input).unwrap()).into_owned(),
             Version::from_str(expected).unwrap()
         );
     }

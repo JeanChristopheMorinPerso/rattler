@@ -22,8 +22,11 @@ use thiserror::Error;
 use version_tree::VersionTree;
 
 use crate::{
-    version::StrictVersion, version_spec::version_tree::ParseVersionTreeError, ParseStrictness,
-    ParseStrictness::Lenient, ParseVersionError, Version, VersionBumpError, VersionBumpType,
+    version::{bump::with_dev_on_last_segment, StrictVersion},
+    version_spec::version_tree::ParseVersionTreeError,
+    ParseStrictness,
+    ParseStrictness::Lenient,
+    ParseVersionError, Version, VersionBumpError, VersionBumpType,
 };
 
 /// An operator to compare two versions.
@@ -367,7 +370,7 @@ impl VersionSpec {
 /// starts with `1.2a` but sorts below it. We intentionally leave that family as
 /// a documented best-effort limitation for now.
 fn starts_with_range(v: &Version) -> Result<Ranges<Version>, VersionBumpError> {
-    let lower = v.with_dev_on_last_segment().into_owned();
+    let lower = with_dev_on_last_segment(v).into_owned();
     let upper = prefix_upper_bound(v)?;
     Ok(Ranges::between(lower, upper))
 }
@@ -377,9 +380,7 @@ fn prefix_upper_bound(v: &Version) -> Result<Version, VersionBumpError> {
     if upper.as_ref() != v {
         Ok(upper.into_owned())
     } else {
-        Ok(v.bump(VersionBumpType::Last)?
-            .with_dev_on_last_segment()
-            .into_owned())
+        Ok(with_dev_on_last_segment(&v.bump(VersionBumpType::Last)?).into_owned())
     }
 }
 
