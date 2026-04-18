@@ -1386,4 +1386,252 @@ mod tests {
             &["0.9", "1", "1.5", "1.999", "2", "3.0", "1!1"],
         );
     }
+
+    mod proptest_fuzz {
+        use std::fmt::Display;
+        use std::str::FromStr;
+
+        use proptest::prelude::*;
+        use version_ranges::Ranges;
+
+        use crate::{
+            version::StrictVersion,
+            version_spec::{EqualityOperator, LogicalOperator, RangeOperator, StrictRangeOperator},
+            Version, VersionSpec,
+        };
+
+        /// Wrapper that uses `Display` for `Debug` output, so proptest
+        /// failure messages show the human-readable representation.
+        #[derive(Clone)]
+        struct Show<T: Display>(T);
+
+        impl<T: Display> std::fmt::Debug for Show<T> {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "{}", self.0)
+            }
+        }
+
+        /// Strategy that generates a `Version` by building a version string and
+        /// parsing it. This avoids needing to construct the complex internal
+        /// representation directly while guaranteeing every generated value is
+        /// a valid `Version`.
+        fn arb_version() -> impl Strategy<Value = Show<Version>> {
+            let epoch = prop_oneof![
+                9 => Just(String::new()),
+                1 => (1..=2u64).prop_map(|e| format!("{e}!")),
+            ];
+
+            let segment_count = 1..=4usize;
+
+            let segments = segment_count.prop_flat_map(|n| {
+                proptest::collection::vec(0..=20u64, n)
+                    .prop_map(|nums| {
+                        nums.iter()
+                            .map(|n| n.to_string())
+                            .collect::<Vec<_>>()
+                            .join(".")
+                    })
+            });
+
+            let suffix = prop_oneof![
+                6 => Just(String::new()),
+                1 => Just("dev".to_string()),
+                1 => Just("post".to_string()),
+                1 => prop_oneof![
+                    Just("a"), Just("rc"), Just("f"), Just("alpha"),
+                ].prop_map(|s| s.to_string()),
+                1 => (
+                    prop_oneof![Just("a"), Just("rc"), Just("dev"), Just("post")],
+                    0..=3u64,
+                ).prop_map(|(s, n)| format!("{s}{n}")),
+            ];
+
+            let local = prop_oneof![
+                8 => Just(String::new()),
+                1 => Just("+local".to_string()),
+                1 => Just("+1".to_string()),
+            ];
+
+            (epoch, segments, suffix, local).prop_map(|(e, segs, suf, loc)| {
+                let s = format!("{e}{segs}{suf}{loc}");
+                Show(
+                    Version::from_str(&s)
+                        .unwrap_or_else(|_| panic!("generated invalid version string: {s}")),
+                )
+            })
+        }
+
+        /// Strategy that generates a `VersionSpec` AST, using `prop_recursive`
+        /// to keep depth and branching small.
+        fn arb_version_spec() -> impl Strategy<Value = Show<VersionSpec>> {
+            let leaf = prop_oneof![
+                1 => Just(VersionSpec::None),
+                1 => Just(VersionSpec::Any),
+                4 => (
+                    prop_oneof![
+                        Just(EqualityOperator::Equals),
+                        Just(EqualityOperator::NotEquals),
+                    ],
+                    arb_version(),
+                ).prop_map(|(op, v)| VersionSpec::Exact(op, v.0)),
+                4 => (
+                    prop_oneof![
+                        Just(RangeOperator::Greater),
+                        Just(RangeOperator::GreaterEquals),
+                        Just(RangeOperator::Less),
+                        Just(RangeOperator::LessEquals),
+                    ],
+                    arb_version(),
+                ).prop_map(|(op, v)| VersionSpec::Range(op, v.0)),
+                4 => (
+                    prop_oneof![
+                        Just(StrictRangeOperator::StartsWith),
+                        Just(StrictRangeOperator::NotStartsWith),
+                        Just(StrictRangeOperator::Compatible),
+                        Just(StrictRangeOperator::NotCompatible),
+                    ],
+                    arb_version(),
+                ).prop_map(|(op, v)| VersionSpec::StrictRange(op, StrictVersion(v.0))),
+            ];
+
+            leaf.prop_recursive(
+                3,  // max depth
+                16, // max nodes
+                4,  // items per collection
+                |inner| {
+                    (
+                        prop_oneof![
+                            Just(LogicalOperator::And),
+                            Just(LogicalOperator::Or),
+                        ],
+                        proptest::collection::vec(inner, 0..=4),
+                    )
+                        .prop_map(|(op, children)| VersionSpec::Group(op, children))
+                },
+            )
+            .prop_map(Show)
+        }
+
+        /// Derive boundary-biased "witness" versions from a spec's endpoints.
+        fn boundary_versions(spec: &VersionSpec) -> Vec<Version> {
+            let mut versions = Vec::new();
+            collect_versions_from_spec(spec, &mut versions);
+            let mut extras = Vec::new();
+            for v in &versions {
+                // dev-appended
+                if let Ok(bumped) = v.bump(crate::VersionBumpType::Last) {
+                    extras.push(bumped);
+                }
+                // version with extra trailing .0
+                if let Ok(extended) = v.extend_to_length(v.segment_count() + 1) {
+                    extras.push(extended.into_owned());
+                }
+            }
+            versions.extend(extras);
+            versions.sort();
+            versions.dedup();
+            versions
+        }
+
+        fn collect_versions_from_spec(spec: &VersionSpec, out: &mut Vec<Version>) {
+            match spec {
+                VersionSpec::None | VersionSpec::Any => {}
+                VersionSpec::Exact(_, v) | VersionSpec::Range(_, v) => {
+                    out.push(v.clone());
+                }
+                VersionSpec::StrictRange(_, sv) => {
+                    out.push(sv.0.clone());
+                }
+                VersionSpec::Group(_, children) => {
+                    for child in children {
+                        collect_versions_from_spec(child, out);
+                    }
+                }
+            }
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(500))]
+
+            /// For every generated VersionSpec and set of Versions, assert
+            /// `spec.matches(v) == ranges.contains(v)` after converting spec
+            /// to `Ranges<Version>`. Skip if `TryFrom` returns `Err`.
+            #[test]
+            fn matches_agrees_with_ranges(
+                spec in arb_version_spec(),
+                random_versions in proptest::collection::vec(arb_version(), 1..=10),
+            ) {
+                let spec = &spec.0;
+                let ranges = match Ranges::<Version>::try_from(spec) {
+                    Ok(r) => r,
+                    Err(_) => return Ok(()),
+                };
+
+                let mut candidates: Vec<Version> =
+                    random_versions.into_iter().map(|v| v.0).collect();
+                candidates.extend(boundary_versions(spec));
+
+                for v in &candidates {
+                    let spec_match = spec.matches(v);
+                    let range_match = ranges.contains(v);
+                    prop_assert_eq!(
+                        spec_match,
+                        range_match,
+                        "mismatch for version={}",
+                        v,
+                    );
+                }
+            }
+
+            /// `VersionSpec → Ranges<Version> → VersionSpec` preserves match
+            /// behavior for all candidate versions.
+            #[test]
+            fn spec_to_ranges_round_trip_preserves_semantics(
+                spec in arb_version_spec(),
+                random_versions in proptest::collection::vec(arb_version(), 1..=10),
+            ) {
+                let spec = &spec.0;
+                let ranges = match Ranges::<Version>::try_from(spec) {
+                    Ok(r) => r,
+                    Err(_) => return Ok(()),
+                };
+                let round_tripped = VersionSpec::from(ranges);
+
+                let mut candidates: Vec<Version> =
+                    random_versions.into_iter().map(|v| v.0).collect();
+                candidates.extend(boundary_versions(spec));
+
+                for v in &candidates {
+                    prop_assert_eq!(
+                        spec.matches(v),
+                        round_tripped.matches(v),
+                        "round-trip mismatch for version={}, round_tripped={}",
+                        v, round_tripped,
+                    );
+                }
+            }
+
+            /// Build `Ranges<Version>` from a spec, convert back to
+            /// `VersionSpec`, then to `Ranges` again and assert exact equality.
+            #[test]
+            fn ranges_to_spec_to_ranges_is_exact(
+                spec in arb_version_spec(),
+            ) {
+                let spec = &spec.0;
+                let ranges = match Ranges::<Version>::try_from(spec) {
+                    Ok(r) => r,
+                    Err(_) => return Ok(()),
+                };
+                let spec2 = VersionSpec::from(ranges.clone());
+                let ranges2 = Ranges::<Version>::try_from(&spec2)
+                    .expect("round-tripped spec should always convert back to Ranges");
+                prop_assert_eq!(
+                    ranges,
+                    ranges2,
+                    "Ranges round-trip not exact, intermediate spec={}",
+                    spec2,
+                );
+            }
+        }
+    }
 }

@@ -76,6 +76,7 @@ rattler_package_streaming = { path = "../rattler_package_streaming", default-fea
   "rustls-tls",
 ] }
 rstest = { workspace = true }
+proptest = { workspace = true }
 assert_matches = { workspace = true }
 hex-literal = { workspace = true }
 criterion = { workspace = true, features = ["html_reports"] }
