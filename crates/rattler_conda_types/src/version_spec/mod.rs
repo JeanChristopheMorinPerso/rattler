@@ -353,35 +353,55 @@ impl VersionSpec {
     }
 }
 
-/// Returns the range `[v_alpha, v.bump(Last).with_alpha())` which
-/// corresponds to all versions that start with `v`.
+/// Returns the interval used to approximate `v.*` / `startswith(v)`.
 ///
-/// The lower bound appends `a0` directly to the last segment (e.g. `1.2` →
-/// `1.2a0`) rather than adding a new `.0a0` segment (which would give
-/// `1.2.0a0`).  This is necessary because `1.2a0 < 1.2.0a0` in conda
-/// version ordering, yet `1.2a0.starts_with(1.2)` is true.
+/// For numeric-tail prefixes we use `dev` sentinels on the last segment, e.g.
+/// `1.2.*` becomes `[1.2dev, 1.3dev)`. This matches the direct prefix logic
+/// because `dev` sorts below identifiers and numerals, whereas `a0` excludes
+/// values like `1.2dev`.
+/// Plain identifier tails such as `1.2a` use an exact identifier ceiling,
+/// e.g. `=1.2a` becomes `[1.2a, 1.2aa)`.
+///
+/// Caveat: prefixes can still have matching versions below their apparent lower
+/// bound if a later segment introduces a `dev` component, e.g. `1.2a.dev`
+/// starts with `1.2a` but sorts below it. We intentionally leave that family as
+/// a documented best-effort limitation for now.
 fn starts_with_range(v: &Version) -> Result<Ranges<Version>, VersionBumpError> {
-    let lower = v.with_alpha_on_last_segment().into_owned();
-    let upper = v.bump(VersionBumpType::Last)?.with_alpha().into_owned();
+    let lower = v.with_dev_on_last_segment().into_owned();
+    let upper = prefix_upper_bound(v)?;
     Ok(Ranges::between(lower, upper))
+}
+
+fn prefix_upper_bound(v: &Version) -> Result<Version, VersionBumpError> {
+    let upper = v.with_a_appended_to_last_plain_identifier();
+    if upper.as_ref() != v {
+        Ok(upper.into_owned())
+    } else {
+        Ok(v.bump(VersionBumpType::Last)?
+            .with_dev_on_last_segment()
+            .into_owned())
+    }
 }
 
 /// Returns the range for all versions compatible with `v` (i.e. `~=v`).
 ///
-/// For multi-segment versions this is `[v, v.pop_segments(1).bump(Last).with_alpha())`.
+/// For multi-segment versions this is `[v, prefix_upper_bound(v.pop_segments(1)))`.
 /// For single-segment versions we need the next epoch boundary instead, so
 /// `~=1` becomes `>=1,<1!0`.
+///
+/// As with [`starts_with_range`], non-numeric tail prefixes are only lowered on
+/// a best-effort basis because a plain interval cannot always express their
+/// exact lower or upper frontier.
 fn compatible_with_range(v: &Version) -> Result<Ranges<Version>, VersionBumpError> {
     let lower = v.clone();
     let upper = if v.segment_count() == 1 {
         Version::from_str(&format!("{}!0", v.epoch() + 1))
             .expect("constructed epoch boundary is always a valid version")
     } else {
-        v.pop_segments(1)
-            .expect("compatible version always has >= 2 segments")
-            .bump(VersionBumpType::Last)?
-            .with_alpha()
-            .into_owned()
+        let prefix = v
+            .pop_segments(1)
+            .expect("compatible version always has >= 2 segments");
+        prefix_upper_bound(&prefix)?
     };
     Ok(Ranges::between(lower, upper))
 }
@@ -1189,6 +1209,65 @@ mod tests {
                 "mismatch for version={v_str}"
             );
         }
+    }
+
+    #[rstest]
+    #[case("1.2.*", "1.2dev", true)]
+    #[case("1.2.*", "1.2dev1", true)]
+    #[case("1.2.*", "1.3dev", false)]
+    #[case("=1.2a", "1.2a", true)]
+    #[case("=1.2a", "1.2a1", true)]
+    #[case("=1.2a", "1.2aa", false)]
+    #[case("=1.2a", "1.2adev", false)]
+    #[case("=1.2f", "1.2f1", true)]
+    #[case("=1.2f", "1.2fa", false)]
+    #[case("=1.2f", "1.2ff", false)]
+    #[case("=1.2", "1.2dev", true)]
+    #[case("=1.2", "1.2dev1", true)]
+    #[case("=1.2", "1.3dev", false)]
+    #[case("=1!1.2", "1!1.2dev", true)]
+    #[case("=1!1.2", "1!1.3dev", false)]
+    #[case("~=1.2a.3", "1.2a4", true)]
+    #[case("~=1.2a.3", "1.2aa", false)]
+    #[case("~=1.1", "1.2dev", true)]
+    #[case("~=1.1", "2dev", false)]
+    #[case("~=1.1", "2dev1", false)]
+    fn test_try_from_matches_consistency_dev_boundaries(
+        #[case] spec_str: &str,
+        #[case] v_str: &str,
+        #[case] expected: bool,
+    ) {
+        let spec = VersionSpec::from_str(spec_str, ParseStrictness::Strict).unwrap();
+        let ranges = Ranges::<Version>::try_from(&spec).unwrap();
+        let version = Version::from_str(v_str).unwrap();
+
+        assert_eq!(
+            spec.matches(&version),
+            expected,
+            "spec.matches mismatch for spec={spec_str}, version={v_str}"
+        );
+        assert_eq!(
+            ranges.contains(&version),
+            expected,
+            "ranges.contains mismatch for spec={spec_str}, version={v_str}"
+        );
+    }
+
+    #[rstest]
+    #[case("=1.2dev", "1.2devdev")]
+    #[case("=1.2a", "1.2a.dev")]
+    #[ignore = "known limitation: non-numeric prefix lowering is still best-effort"]
+    fn test_try_from_matches_consistency_non_numeric_prefix_boundaries(
+        #[case] spec_str: &str,
+        #[case] v_str: &str,
+    ) {
+        let spec = VersionSpec::from_str(spec_str, ParseStrictness::Strict).unwrap();
+        let ranges = Ranges::<Version>::try_from(&spec).unwrap();
+        assert_eq!(
+            spec.matches(&Version::from_str(v_str).unwrap()),
+            ranges.contains(&Version::from_str(v_str).unwrap()),
+            "mismatch for spec={spec_str}, version={v_str}"
+        );
     }
 
     #[test]

@@ -112,6 +112,77 @@ impl Version {
         })
     }
 
+    /// Appends `dev` to the *last* segment instead of adding a new segment.
+    ///
+    /// For example, `1.2` becomes `1.2dev` (segments: `[1], [2, dev]`).
+    /// This is useful when lowering prefix-style constraints to an interval,
+    /// because `dev` sorts below numerals and identifiers whereas `a0` does
+    /// not.
+    ///
+    /// If the last segment already contains a non-numeric component the version
+    /// is returned unchanged. That keeps this helper focused on numeric-tail
+    /// prefixes such as `1.2` or `1.2.3`, which are the cases where the `dev`
+    /// floor is exact. Prefixes that already end in a non-numeric component can
+    /// still have versions below this returned value while matching the same
+    /// prefix (for example `1.2dev.dev` starts with `1.2dev` but sorts below it).
+    pub fn with_dev_on_last_segment(&self) -> Cow<'_, Self> {
+        let last_segment = self.segments().last().expect("at least one segment");
+        let has_non_numeric = last_segment.components().any(|c| !c.is_numeric());
+        if has_non_numeric {
+            return Cow::Borrowed(self);
+        }
+        let local_segment_index = self.local_segment_index().unwrap_or(self.segments.len());
+        let mut segments = self.segments[0..local_segment_index].to_vec();
+        let components_offset = segments.iter().map(|s| s.len() as usize).sum::<usize>()
+            + usize::from(self.has_epoch());
+
+        let last = segments.last_mut().expect("at least one segment");
+        *last = last.with_component_count(last.len() + 1).unwrap();
+
+        segments.extend(self.segments[local_segment_index..].iter());
+
+        let mut components = self.components.clone();
+        components.insert(components_offset, Component::Dev);
+
+        Cow::Owned(Version {
+            components,
+            segments: segments.into(),
+            flags: self.flags,
+        })
+    }
+
+    /// Appends `a` to the final plain identifier component of the last segment.
+    ///
+    /// For example, `1.2a` becomes `1.2aa` and `1.2rc` becomes `1.2rca`.
+    /// This is useful as an exclusive upper bound for prefix-style constraints
+    /// that end in a normal identifier, because any version that still starts
+    /// with that identifier sorts below the identifier with an appended `a`.
+    ///
+    /// If the last component is not a plain identifier (for example a numeral,
+    /// `dev`, or `post`) the version is returned unchanged.
+    pub fn with_a_appended_to_last_plain_identifier(&self) -> Cow<'_, Self> {
+        let local_segment_index = self.local_segment_index().unwrap_or(self.segments.len());
+        let segments = self.segments[0..local_segment_index].to_vec();
+        let components_end = segments.iter().map(|s| s.len() as usize).sum::<usize>()
+            + usize::from(self.has_epoch());
+        let last_component_idx = components_end
+            .checked_sub(1)
+            .expect("at least one component");
+
+        let Some(Component::Iden(last_component)) = self.components.get(last_component_idx) else {
+            return Cow::Borrowed(self);
+        };
+
+        let mut components = self.components.clone();
+        components[last_component_idx] = Component::Iden(format!("{last_component}a").into());
+
+        Cow::Owned(Version {
+            components,
+            segments: self.segments.clone(),
+            flags: self.flags,
+        })
+    }
+
     /// Remove the local segment from the version if it exists.
     /// Returns a new version without the local segment.
     ///
@@ -424,6 +495,40 @@ mod test {
                 .bump(VersionBumpType::Segment(idx))
                 .unwrap()
                 .with_alpha()
+                .into_owned(),
+            Version::from_str(expected).unwrap()
+        );
+    }
+
+    #[rstest]
+    #[case("1.2", "1.2dev")]
+    #[case("1.2.3", "1.2.3dev")]
+    #[case("5!1.2+local", "5!1.2dev+local")]
+    #[case("1.2a", "1.2a")]
+    #[case("1.2dev", "1.2dev")]
+    fn with_dev_on_last_segment(#[case] input: &str, #[case] expected: &str) {
+        assert_eq!(
+            Version::from_str(input)
+                .unwrap()
+                .with_dev_on_last_segment()
+                .into_owned(),
+            Version::from_str(expected).unwrap()
+        );
+    }
+
+    #[rstest]
+    #[case("1.2a", "1.2aa")]
+    #[case("1.2f", "1.2fa")]
+    #[case("1.2rc", "1.2rca")]
+    #[case("5!1.2a+local", "5!1.2aa+local")]
+    #[case("1.2", "1.2")]
+    #[case("1.2dev", "1.2dev")]
+    #[case("1.2a1", "1.2a1")]
+    fn with_a_appended_to_last_plain_identifier(#[case] input: &str, #[case] expected: &str) {
+        assert_eq!(
+            Version::from_str(input)
+                .unwrap()
+                .with_a_appended_to_last_plain_identifier()
                 .into_owned(),
             Version::from_str(expected).unwrap()
         );
