@@ -76,38 +76,6 @@ impl Version {
         })
     }
 
-    /// Appends `a` to the final plain identifier component of the last segment.
-    ///
-    /// For example, `1.2a` becomes `1.2aa` and `1.2rc` becomes `1.2rca`.
-    /// This is useful as an exclusive upper bound for prefix-style constraints
-    /// that end in a normal identifier, because any version that still starts
-    /// with that identifier sorts below the identifier with an appended `a`.
-    ///
-    /// If the last component is not a plain identifier (for example a numeral,
-    /// `dev`, or `post`) the version is returned unchanged.
-    pub fn with_a_appended_to_last_plain_identifier(&self) -> Cow<'_, Self> {
-        let local_segment_index = self.local_segment_index().unwrap_or(self.segments.len());
-        let segments = self.segments[0..local_segment_index].to_vec();
-        let components_end = segments.iter().map(|s| s.len() as usize).sum::<usize>()
-            + usize::from(self.has_epoch());
-        let last_component_idx = components_end
-            .checked_sub(1)
-            .expect("at least one component");
-
-        let Some(Component::Iden(last_component)) = self.components.get(last_component_idx) else {
-            return Cow::Borrowed(self);
-        };
-
-        let mut components = self.components.clone();
-        components[last_component_idx] = Component::Iden(format!("{last_component}a").into());
-
-        Cow::Owned(Version {
-            components,
-            segments: self.segments.clone(),
-            flags: self.flags,
-        })
-    }
-
     /// Remove the local segment from the version if it exists.
     /// Returns a new version without the local segment.
     ///
@@ -353,6 +321,40 @@ pub(crate) fn with_dev_on_last_segment(version: &Version) -> Cow<'_, Version> {
     })
 }
 
+/// Appends `a` to the final plain identifier component of the last segment.
+///
+/// For example, `1.2a` becomes `1.2aa` and `1.2rc` becomes `1.2rca`.
+/// This is useful as an exclusive upper bound for prefix-style constraints
+/// that end in a normal identifier, because any version that still starts
+/// with that identifier sorts below the identifier with an appended `a`.
+///
+/// If the last component is not a plain identifier (for example a numeral,
+/// `dev`, or `post`) the version is returned unchanged.
+pub(crate) fn with_a_appended_to_last_plain_identifier(version: &Version) -> Cow<'_, Version> {
+    let local_segment_index = version
+        .local_segment_index()
+        .unwrap_or(version.segments.len());
+    let segments = version.segments[0..local_segment_index].to_vec();
+    let components_end =
+        segments.iter().map(|s| s.len() as usize).sum::<usize>() + usize::from(version.has_epoch());
+    let last_component_idx = components_end
+        .checked_sub(1)
+        .expect("at least one component");
+
+    let Some(Component::Iden(last_component)) = version.components.get(last_component_idx) else {
+        return Cow::Borrowed(version);
+    };
+
+    let mut components = version.components.clone();
+    components[last_component_idx] = Component::Iden(format!("{last_component}a").into());
+
+    Cow::Owned(Version {
+        components,
+        segments: version.segments.clone(),
+        flags: version.flags,
+    })
+}
+
 #[cfg(test)]
 mod test {
     use crate::{Version, VersionBumpType};
@@ -489,9 +491,7 @@ mod test {
     #[case("1.2a1", "1.2a1")]
     fn with_a_appended_to_last_plain_identifier(#[case] input: &str, #[case] expected: &str) {
         assert_eq!(
-            Version::from_str(input)
-                .unwrap()
-                .with_a_appended_to_last_plain_identifier()
+            super::with_a_appended_to_last_plain_identifier(&Version::from_str(input).unwrap())
                 .into_owned(),
             Version::from_str(expected).unwrap()
         );

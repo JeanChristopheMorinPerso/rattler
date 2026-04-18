@@ -22,7 +22,10 @@ use thiserror::Error;
 use version_tree::VersionTree;
 
 use crate::{
-    version::{bump::with_dev_on_last_segment, StrictVersion},
+    version::{
+        bump::{with_a_appended_to_last_plain_identifier, with_dev_on_last_segment},
+        StrictVersion,
+    },
     version_spec::version_tree::ParseVersionTreeError,
     ParseStrictness,
     ParseStrictness::Lenient,
@@ -376,7 +379,7 @@ fn starts_with_range(v: &Version) -> Result<Ranges<Version>, VersionBumpError> {
 }
 
 fn prefix_upper_bound(v: &Version) -> Result<Version, VersionBumpError> {
-    let upper = v.with_a_appended_to_last_plain_identifier();
+    let upper = with_a_appended_to_last_plain_identifier(v);
     if upper.as_ref() != v {
         Ok(upper.into_owned())
     } else {
