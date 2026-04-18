@@ -5106,6 +5106,7 @@ dependencies = [
  "tokio",
  "tracing-subscriber",
  "url",
+ "version-ranges",
 ]
 
 [[package]]
